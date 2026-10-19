@@ -1,7 +1,9 @@
 """Process startup phases; diagnostics remain in the gateway facade."""
 from __future__ import annotations
 
+import asyncio
 import logging
+import sys
 import threading
 import time
 from pathlib import Path
@@ -297,6 +299,29 @@ async def _start_gateway_start_control_socket(runner):
         # manager) relaunches after the code swap.
         _main_loop = asyncio.get_running_loop()
 
+        def _webapp_launch_ticket_handler() -> dict:
+            """Mint the one-use private launch ticket the Webapp handoff needs, in-process.
+
+            Only the process serving the listener can mint it: the session token it signs is
+            process-local and never published. The mount is ensured first — a gateway that has
+            never answered a request has not bound its surface yet."""
+            mount = getattr(runner, "dashboard_mount", None)
+            if mount is None:
+                return {"error": "listener_not_mounted"}
+            future = asyncio.run_coroutine_threadsafe(mount.ensure(), _main_loop)
+            try:
+                future.result(timeout=60)
+            except Exception as exc:  # noqa: BLE001 - reported to the caller, never raised
+                return {"error": f"mount_failed: {exc}"}
+            web = sys.modules.get("hermes_cli.web_server")
+            if web is None:
+                return {"error": "web_server_not_mounted"}
+            from hermes_cli.web_server_surface import private_launch
+            if not private_launch(web.app.state):
+                return {"webapp": False}
+            from hermes_cli.web_routers.webapp import mint_launch_ticket
+            return {"webapp": True, "ticket": mint_launch_ticket(web.app.state)}
+
         def _pause_for_update_handler() -> dict:
             try:
                 from hermes_cli.gateway import _get_restart_drain_timeout
@@ -336,6 +361,7 @@ async def _start_gateway_start_control_socket(runner):
 
         _control_server = GatewayControlServer(
             verb_handlers={"pause-for-update": _pause_for_update_handler, "identify": _identify_runtime,
+                           "webapp-launch-ticket": _webapp_launch_ticket_handler,
                            "rescan-profiles": _rescan_profiles_handler,
                            "migrate-profile-identity": migrate_profile_identity_verb(runner),
                            "unserve-profile": unserve_profile_verb(runner),

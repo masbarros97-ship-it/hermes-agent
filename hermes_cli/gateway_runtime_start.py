@@ -26,6 +26,11 @@ DAEMON_STRIPPED_ENV = (
     "HERMES_INTERACTIVE", "HERMES_GATEWAY_SESSION", "HERMES_SINGLE_QUERY_SESSION",
     "HERMES_EPHEMERAL_SYSTEM_PROMPT", "HERMES_PREFILL_MESSAGES_FILE", "HERMES_INFERENCE_PROVIDER",
     "HERMES_ENABLE_PROJECT_PLUGINS", "HERMES_TUI_CLIENT_ENV",
+    # systemd unit markers: a gateway a Webapp-as-a-unit starts inherits the unit's environment,
+    # and _detect_supervisor reads INVOCATION_ID as "this is systemd's child". Without the strip
+    # it reports supervisor=systemd, the "started inside this unit" warning never fires, and a
+    # later `hermes gateway restart` drains a gateway nothing will relaunch.
+    "INVOCATION_ID", "JOURNAL_STREAM", "SYSTEMD_EXEC_PID", "MANAGERPID", "NOTIFY_SOCKET",
 )
 
 

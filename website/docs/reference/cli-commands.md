@@ -68,7 +68,7 @@ The install also ships `hermes-agent`, a minimal runner that sends one query and
 | `hermes status` | Show agent, auth, and platform status. |
 | `hermes usage` | Show the configured account's rate-limit windows (the `/usage` block) without a session; `--json` for scripts. |
 | `hermes cron` | Inspect and tick the cron scheduler. |
-| `hermes pause` / `hermes resume` | Global emergency stop: no new cron fires (built-in ticker, managed-cron webhook, misfire catch-up), kanban dispatch or gateway turns start until resumed. Interactive CLI, TUI and Desktop turns are gateway turns, so they are held too, and each surface shows "Hermes is paused" with the reason and "run `hermes resume`". Turns already running finish; in-flight work is never killed. |
+| `hermes pause` / `hermes resume` | Global emergency stop: no new cron fires (built-in ticker, managed-cron webhook, misfire catch-up), kanban dispatch or gateway turns start until resumed; in-flight work is never killed. |
 | `hermes kanban` | Multi-profile collaboration board (tasks, links, dispatcher). |
 | `hermes project` | Manage named, multi-folder workspaces (projects). Anchors desktop session grouping and, when bound to a kanban board, gives tasks a deterministic worktree + branch convention. State is per-profile. |
 | `hermes webhook` | Manage dynamic webhook subscriptions for event-driven activation. |
@@ -105,6 +105,7 @@ The install also ships `hermes-agent`, a minimal runner that sends one query and
 | `hermes claw` | OpenClaw migration helpers. |
 | `hermes import-agent` | Import a Claude Code (`~/.claude`) or Codex CLI (`~/.codex`) setup. |
 | `hermes dashboard` | Launch the web dashboard for managing config, API keys, and sessions. |
+| `hermes webapp` | Launch the Desktop workspace in a normal browser against this host. |
 | `hermes serve` | Start the Hermes backend server (headless; powers the desktop app and remote backends). |
 | `hermes desktop` (alias `gui`) | Build and launch the native Electron desktop app. |
 | `hermes profile` | Manage profiles — multiple isolated Hermes instances. |
@@ -1664,7 +1665,6 @@ Unified plugin management — general plugins, memory providers, and context eng
 | `install <identifier> [--force] [--ref COMMIT_SHA] [--allow-removed]` | Install a plugin from the Hermes plugin catalog (bare entry name), a Git URL, or `owner/repo` shorthand. Catalog names resolve to the reviewed 40-hex commit SHA and show declared capabilities. Source, checked-out revision, and a nested catalog-provenance block are recorded in the installer's `plugins/.install-metadata.json`; the `.hermes-catalog.json` copy inside the plugin directory is only for convenience and is never trusted. Raw URLs are flagged as custom (unreviewed) sources. `--ref` selects a full-SHA custom pin and records the SHA actually checked out. `--allow-removed` (DANGEROUS) bypasses the removed-plugin blocklist at install and exempts that install from update, enable, and load-time kill-list checks. |
 | `search [term] [--json]` | Search the Hermes plugin catalog (matches entry names, descriptions, and declared tools; omit `term` to list everything). The catalog is curated in-repo (`plugin-catalog/`), refreshed from the live repo with a 6-hour cache, and falls back to the in-tree copy offline. Cataloged ≠ audited — admission reviews the entry, not the code. |
 | `update <name>` | Re-pin catalog installs to the reviewed catalog SHA, or update a custom Git install from its recorded source/feed. PM validates active-plugin dependencies before code publication. Explicit custom pins move only with `install --force --ref <new-commit>`. |
-| `update [--yes]` | With no name: list every installed plugin that has an update `update <name>` can apply (catalog re-pin or Git pull) plus the ones it skips and why, then ask `Update all N? [Y/n]` and update each through the single-plugin path (per-plugin consent prompts still apply). One failure does not stop the rest; exits 1 if any failed. Without a terminal nothing is updated unless `--yes` is passed; `--yes` keeps consent fail-closed (new capabilities stay ungranted). |
 | `remove <name>` (aliases: `rm`, `uninstall`) | Remove an installed plugin. |
 | `enable <name>` | Enable a disabled plugin. |
 | `disable <name>` | Disable a plugin without removing it. |
@@ -1783,6 +1783,7 @@ Subcommands:
 | `archive` | Bulk-archive (soft-hide, no deletion) sessions matching the same filters as `prune`. Requires at least one filter. |
 | `stats` | Show session-store statistics. |
 | `rename <session-id> <title>` | Set or change a session title. |
+| `adopt [--dry-run]` | Bring this profile's pre-gateway local chats (CLI, TUI and Desktop history written before the gateway owned sessions) under its gateway in one pass, so remote clients such as the Webapp can continue them. A native client on the host adopts a chat the first time it opens it; remote logins never make that first claim. Run it as the gateway's OS user (`hermes -p <profile> sessions adopt` for another profile); `--dry-run` only counts. Chats whose saved model route is gone are reported for you to open once and pick a model. |
 | `optimize` | Reclaim disk space: merge FTS5 index segments + VACUUM. Non-destructive — no session data changes. |
 | `optimize-storage` | Migrate the full-text search index to the compact v23 external-content layout; on large databases this reclaims a large fraction of `state.db`. |
 | `repair` | Repair a malformed `state.db` schema (e.g. `table messages_fts already exists`) so hidden sessions reappear; a backup is made first. |
@@ -1872,6 +1873,58 @@ Import a **Claude Code** (`~/.claude`) or **OpenAI Codex CLI** (`~/.codex`) setu
 | `--sync` | Re-import every previously imported source whose files changed since the last import. Prompt-free; combine with `--dry-run` to preview. |
 
 Every successful import registers its source in `~/.hermes/import-sync.json`; `hermes import-agent --sync` then re-imports any registered source whose files changed (a cron-friendly way to keep an imported Claude Code / Codex setup current). See the **[import guide](../user-guide/import-from-other-agents.md)** for the full mapping tables.
+
+## `hermes webapp`
+
+```bash
+hermes webapp [options]
+```
+
+Build and launch the current Hermes Desktop workspace in a normal browser. It
+uses the same hardened FastAPI server and authentication gate as
+`hermes dashboard`, but serves the Desktop renderer instead of the dashboard
+admin UI. Chats run on the profile's gateway, which the Webapp starts if none is
+running and relays the browser to; the Webapp itself runs no turns. See
+[Desktop App → Use the Desktop workspace from a browser](../user-guide/desktop.md#use-the-desktop-workspace-from-a-browser).
+
+For a loopback launch, use the **private launch link** printed by the command
+(including with `--no-open`). Its fragment carries the existing session token
+for privileged APIs, including host files, command execution and the terminal.
+The Webapp never includes this credential in public HTML. Do not share the
+link or publish captured CLI output. The browser removes the fragment and
+keeps the token in tab-local `sessionStorage`, so reload/reconnect works.
+
+A fresh tab needs the original launch link; a bare URL shows instructions
+instead of granting access. To manage a named profile on an existing server,
+open its `?profile=<name>` URL in an already authorized tab, or add that query
+**before** the original launch link's `#` fragment. If you lost the link, restart
+that Webapp to print a new one. Restarting invalidates old links. Authenticated
+remote Webapps continue to use OAuth cookies and single-use WebSocket tickets.
+Automatic local browser launch never hands the secret URL to the OS browser
+launcher (whose command line other local users may read). It opens a one-use
+launch URL instead, valid for 60 seconds, which the browser exchanges for the
+session; on Linux only a connection owned by your own OS user can redeem it. A
+second use shows instructions instead of granting access.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--port` | `9119` | Port to run the web server on (`0` asks the OS to assign one) |
+| `--host` | `127.0.0.1` | Bind address; non-loopback binds always require an auth provider |
+| `--no-open` | — | Don't open a browser automatically |
+| `--skip-build` | off | Reuse `apps/desktop/dist-webapp` without building |
+| `--force-build` | off | Rebuild even when the renderer's build receipt is current |
+| `--build-only` | off | Build the renderer but do not start the server |
+| `--isolated` | off | Keep a named-profile launch scoped to that profile instead of routing to the machine server |
+| `--stop` | — | Stop browser-hosted Desktop Webapp processes and exit (gateways and native Desktop `serve` backends are not touched) |
+| `--status` | — | List browser-hosted Desktop Webapp processes and exit |
+
+```bash
+# Local browser
+hermes webapp
+
+# Reach it through a trusted LAN/VPN; auth is mandatory
+hermes webapp --host 0.0.0.0 --no-open
+```
 
 ## `hermes serve`
 

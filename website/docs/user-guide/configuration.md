@@ -283,6 +283,8 @@ warns about directories over 1 GB elsewhere under `cache/` that no pruner covers
 
 `desktop.font_family` sets the font for chat and the rest of the Hermes Desktop interface (the terminal pane has its own key above). Give it one installed family name (for example, `OpenDyslexic` or `Atkinson Hyperlegible`) or a CSS font stack; Hermes keeps the active theme's own stack behind it so CJK and emoji glyphs still resolve, and an empty value uses the theme's font. Edit it in **Settings → Appearance → Chat Font**.
 
+`desktop.theme` and `desktop.theme_mode` hold the profile's Hermes Desktop appearance: the theme picked in **Settings → Appearance** (a Desktop theme name, independent of the CLI's `display.skin`) and `light`, `dark` or `system`. The app writes them when you pick, so the Webapp and every Desktop connected to the profile paint the same look; `system` still follows each device's OS setting. Empty means never picked, and each client keeps its own local choice.
+
 `terminal.font_family` controls the embedded terminal in Hermes Desktop. It accepts either one locally installed family name (for example, `MesloLGS NF`) or a CSS font stack. Hermes appends its bundled JetBrains Mono stack as a fallback, and an empty value keeps the default. You can edit the same profile-scoped setting in **Settings → Appearance → Terminal Font**; no Google Fonts download or system-font permission is required.
 
 For cloud sandboxes such as Modal, Daytona, and Vercel Sandbox, `container_persistent: true` means Hermes will try to preserve filesystem state across sandbox recreation. It does not promise that the same live sandbox, PID space, or background processes will still be running later.
@@ -1145,43 +1147,6 @@ message. The user receives a rejection notice and must resend. Hermes does not
 automatically requeue the message because doing so without durable ordering and
 idempotency could process it twice. Non-positive values use the 5-second
 default.
-
-## Gateway Restart Drain
-
-When the gateway stops or restarts (SIGTERM, `hermes update`, `hermes gateway stop`, or the final
-phase of `hermes gateway restart` / `/restart`), `agent.restart_drain_timeout` is how many seconds
-it lets in-flight chat turns keep running before it interrupts them:
-
-```yaml
-agent:
-  restart_drain_timeout: 0          # default: interrupt in-flight chat turns at once
-  cron_drain_timeout: 30            # floor for cron jobs and api_server (/v1) runs
-  restart_after_turn_timeout: 1800  # /restart and `gateway restart`: wait for turns BEFORE stopping
-```
-
-With the default `0`, a restart interrupts a running turn immediately. The turn settles as
-interrupted and is never run again; the TUI and Desktop show a "Gateway restarting" (or "Gateway
-shutting down") notice on that turn, and you send the message again once Hermes reconnects.
-Queued messages behind it are kept and run in order on the new gateway.
-
-Set a positive value if you would rather let turns finish:
-
-```yaml
-agent:
-  restart_drain_timeout: 60
-```
-
-A longer drain makes every restart and update wait up to that long. `HERMES_RESTART_DRAIN_TIMEOUT`
-overrides the config value.
-
-:::caution systemd `TimeoutStopSec`
-The generated systemd unit sizes `TimeoutStopSec` from this value: the larger of
-`restart_drain_timeout` and `cron_drain_timeout` + 10 s, plus 30 s of headroom, and at least 60 s
-(`gateway/restart.py`, `resolve_systemd_timeout_stop_sec`). If you raise `restart_drain_timeout`,
-re-run `hermes gateway install` so the unit picks up the new budget. Otherwise systemd SIGKILLs the
-gateway in the middle of its drain. launchd caps its stop timeout at 60 s, so on macOS the drain
-is limited to what fits inside that.
-:::
 
 ## Session Stall Watchdog
 

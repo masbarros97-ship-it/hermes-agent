@@ -229,20 +229,17 @@ def managed_turn_count(runner):
     return uncounted_runtime_work(runner)
 
 
-def stop_authority_turns(authority, *, in_process=False, reason=None):
+def stop_authority_turns(authority, *, in_process=False):
     """Cooperative Stop for every turn *authority* is executing: the control a user's Stop sends to a
     managed worker (acknowledged, or terminated within STOP_ACK_SECONDS, and the admission settles
     through its own fenced path). ``in_process`` also hard-interrupts the running agent of each
-    executing in-process turn, or latches the generation ``adopt_agent`` consumes before it exists.
-    ``reason`` (a gateway restart/shutdown) is recorded on each worker it signals, so the turn settles
-    with that cause; a worker already stopped (the user's Stop came first) keeps none."""
+    executing in-process turn, or latches the generation ``adopt_agent`` consumes before it exists."""
     from hermes_state_runtime import RuntimeStoreError
     signalled = 0
     workers = getattr(authority, '_managed_workers', {})
     for worker in list(workers.values()):
         if worker.closed.is_set() or (getattr(worker, 'stop', None) is not None and worker.stop.is_set()):
             continue
-        worker.stop_cause = reason
         try:
             worker.control({'type': 'stop'})
         except RuntimeStoreError as exc:
@@ -270,9 +267,9 @@ def stop_authority_turns(authority, *, in_process=False, reason=None):
     return signalled
 
 
-def stop_managed_turns(runner, reason=None):
+def stop_managed_turns(runner):
     """``stop_authority_turns`` across every served authority (whole-runtime shutdown)."""
-    return sum(stop_authority_turns(authority, reason=reason) for authority in _authorities(runner))
+    return sum(stop_authority_turns(authority) for authority in _authorities(runner))
 
 
 def interrupt_side_agents(runner, reason):
@@ -537,7 +534,7 @@ def publish_gateway_runtime_ready(runner):
     if runner.session_api.task.done() or not runner._running or runner._draining:
         raise RuntimeError('gateway stopped before session API readiness')
     descriptor.update(state='ready', capabilities=[
-        'session-authority-v1', 'durable-admission-v1', 'event-replay-v1'])
+        'session-authority-v1', 'durable-admission-v1', 'event-replay-v1', 'delegated-attach-v1'])
     from gateway.session_hosted_service import start_ready_hosted_services
     start_ready_hosted_services(runner)
 
@@ -580,7 +577,7 @@ async def drain_gateway_runtime(runner):
             adapter.set_message_handler(None)
 
 
-async def settle_gateway_runtime(runner, budget=None, reason=None):
+async def settle_gateway_runtime(runner, budget=None):
     """Keep authority tasks alive until their last durable settlement write, within a bound.
 
     A managed turn still running here gets its Stop first (its worker acknowledges or is
@@ -590,7 +587,7 @@ async def settle_gateway_runtime(runner, budget=None, reason=None):
     the executor quiesce skips the DB close while a writer is live, and process exit releases
     the ownership lock, so raising here would only skip teardown and disarm the watchdog."""
     authorities = _authorities(runner)
-    stop_managed_turns(runner, reason)
+    stop_managed_turns(runner)
     from gateway.session_llm_oneshot import stop as stop_oneshots
     for authority in authorities:
         stop_oneshots(authority)  # an answer is no durable settlement: never waited for

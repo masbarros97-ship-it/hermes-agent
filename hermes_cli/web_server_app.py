@@ -134,7 +134,9 @@ async def standalone_lifespan(app: "FastAPI"):
         )
         cron_thread.start()
 
-    # Reap idle/dead keep-alive PTY sessions (30-min TTL).
+    # Reap idle/dead keep-alive PTY sessions (30-min TTL). The registry is process-wide and
+    # close_all() refuses new spawns, so a re-entered lifespan reopens it first.
+    PTY_REGISTRY._closed = False
     pty_reaper_task = asyncio.create_task(run_reaper(PTY_REGISTRY))
     # Periodic authenticated self-test feeding the ``dashboard`` component on /api/status.
     selftest_task = asyncio.create_task(_dashboard_selftest_loop())
@@ -212,6 +214,7 @@ async def http_lifespan(app: FastAPI):
     app.state.event_lock = asyncio.Lock()
     app.state.pty_active_session_files = {}
     app.state.chat_argv_lock = asyncio.Lock()
+    PTY_REGISTRY._closed = False  # a prior lifespan's close_all() refuses spawns until reopened
     tasks = [
         asyncio.create_task(run_reaper(PTY_REGISTRY), name="gateway-api-pty-reaper"),
         asyncio.create_task(_dashboard_selftest_loop(), name="gateway-api-selftest"),
@@ -228,6 +231,10 @@ async def http_lifespan(app: FastAPI):
 
 @asynccontextmanager
 async def app_lifespan(app: FastAPI):
-    lifespan = http_lifespan if getattr(app.state, "gateway_runner", None) is not None else standalone_lifespan
+    from hermes_cli.web_server_surface import policy
+    if getattr(app.state, "gateway_runner", None) is not None:
+        lifespan = http_lifespan
+    else:
+        lifespan = standalone_lifespan
     async with lifespan(app):
         yield

@@ -223,7 +223,41 @@ def _maybe_open_browser(host: str, actual_port: int, open_browser: bool, initial
     Skips headless Linux (no DISPLAY/WAYLAND_DISPLAY) so a TUI browser can't
     SIGHUP the server; maps ``0.0.0.0``/``::`` binds to ``127.0.0.1``.
     """
+    from hermes_cli.web_server import app
+    from hermes_cli.web_server_surface import private_launch
+    from urllib.parse import quote, urlencode
+
+    from hermes_cli.url_utils import format_url_host
+
+    display_host = host if host not in ("0.0.0.0", "::") else "127.0.0.1"
+    origin = f"http://{format_url_host(display_host)}:{actual_port}"
+    query = f"?profile={quote(initial_profile, safe='')}" if initial_profile else ""
+    _open_url = f"{origin}/{query}" if query else origin
+    private = private_launch(app.state)
+    if private:
+        from hermes_cli.web_server import _SESSION_TOKEN
+
+        _open_url += f"#hermes-session={quote(_SESSION_TOKEN, safe='')}"
+        # Operator-only handoff, including --no-open/headless launches. Never log
+        # or serve this URL, or put the credential in a query string.
+        #
+        # Only an interactive terminal gets the full link. A Webapp run as a service (or restarted
+        # by `hermes update`) has stdout on journald, where the token would land in the clear; the
+        # same credential is already in this profile's 0600 host record.
+        if sys.stdout.isatty():
+            print(f"  Webapp launch link (private; grants host access): {_open_url}", flush=True)
+        else:
+            print("  Webapp is private and this output is not a terminal, so the launch link is not")
+            print("  printed here: it carries the host credential. Start it from an interactive shell")
+            print("  (`hermes webapp`) to get the private link.")
+
     if not open_browser:
+        return
+
+    if private and sys.platform == "darwin":
+        # macOS launch arguments are not a same-user credential channel. Until
+        # an authenticated OS handoff exists, keep the operator-only link above.
+        print("  On macOS, open the private launch link above in your browser.", flush=True)
         return
 
     import webbrowser
@@ -236,18 +270,19 @@ def _maybe_open_browser(host: str, actual_port: int, open_browser: bool, initial
         )
         return
 
-    from hermes_cli.url_utils import format_url_host
-
-    _display_host = host if host not in ("0.0.0.0", "::") else "127.0.0.1"
-    _open_url = f"http://{format_url_host(_display_host)}:{actual_port}"
-    if initial_profile:
-        from urllib.parse import quote
-        _open_url += f"/?profile={quote(initial_profile)}"
-
     def _open():
         try:
             time.sleep(1.0)
-            webbrowser.open(_open_url)
+            target = _open_url
+            if private:
+                # Browser launchers put their URL in argv (world-readable on Linux), so it
+                # carries a one-use launch ticket, never the token. A URL rather than a local
+                # redirect file, which snap/Flatpak browsers cannot read under hidden dirs.
+                from hermes_cli.web_routers.webapp import mint_launch_ticket
+
+                fragment = urlencode({"ticket": mint_launch_ticket(app.state), "query": query})
+                target = f"{origin}/webapp/launch#{fragment}"
+            webbrowser.open(target)
         except Exception:
             pass
 
@@ -519,33 +554,6 @@ def _dashboard_forwarded_allow_ips(dashboard_config: dict[str, Any]) -> list[str
     return trusted
 
 
-def _uvicorn_console_logging() -> None:
-    """uvicorn's default console logging, without its ``dictConfig``.
-
-    ``uvicorn.Config``'s default ``log_config`` runs ``dictConfig``, which calls
-    ``logging.shutdown()`` on every live handler: a multiplexed gateway's profile log routers are
-    already installed when its listener is built, and a closed router stays closed. The listeners
-    pass ``log_config=None`` and get uvicorn's handlers here instead: ``uvicorn`` to stderr,
-    ``uvicorn.access`` to stdout, neither propagating into the Hermes log files.
-    """
-    from uvicorn.config import LOGGING_CONFIG
-    from uvicorn.logging import AccessFormatter, DefaultFormatter
-
-    formats = LOGGING_CONFIG["formatters"]
-    for name, stream, formatter in (
-        ("uvicorn", sys.stderr, DefaultFormatter(formats["default"]["fmt"])),
-        ("uvicorn.access", sys.stdout, AccessFormatter(formats["access"]["fmt"])),
-    ):
-        logger = logging.getLogger(name)
-        logger.propagate = False
-        if not logger.handlers:  # a second listener in this process keeps the first one's
-            handler = logging.StreamHandler(stream)
-            handler.setFormatter(formatter)
-            logger.addHandler(handler)
-    # LOGGING_CONFIG's level for the parent; uvicorn.Config sets only the child loggers' levels.
-    logging.getLogger("uvicorn").setLevel(logging.INFO)
-
-
 def build_listener_server(served_app, host: str, port: int, *, auth_required: bool,
                           ws_ping: Optional[tuple[float, float]] = None,
                           timeout_graceful_shutdown: Optional[float] = 3, lifespan: str = "auto"):
@@ -578,9 +586,8 @@ def build_listener_server(served_app, host: str, port: int, *, auth_required: bo
     if ws_ping is None:
         ws_ping = (None, None) if host in _LOOPBACK_HOST_VALUES else (
             _ws_ping_setting("ws_ping_interval"), _ws_ping_setting("ws_ping_timeout"))
-    _uvicorn_console_logging()
     config = uvicorn.Config(
-        served_app, host=host, port=port, log_level="warning", log_config=None,
+        served_app, host=host, port=port, log_level="warning",
         # Off by default so _ws_client_is_allowed sees the real peer, not
         # X-Forwarded-For. Gated mode runs behind a TLS terminator and needs
         # X-Forwarded-Proto for cookie Secure flags.

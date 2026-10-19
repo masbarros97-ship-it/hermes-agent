@@ -39,7 +39,6 @@ import {
   sessionTileOwnerRoute
 } from '@/store/session-states'
 import { broadcastSessionsChanged } from '@/store/session-sync'
-import { flushStreamDeltas } from '@/store/stream-delta-flush'
 import { clearSessionSubagents } from '@/store/subagents'
 import { clearSessionTodos } from '@/store/todos'
 import { setSessionDraftingTool } from '@/store/tool-drafting'
@@ -49,6 +48,7 @@ import type { GatewayRequester } from '../contrib/types'
 import { uploadComposerAttachment } from '../session/hooks/use-prompt-actions'
 import { isStaleTargetError } from '../session/hooks/use-prompt-actions'
 import {
+  appendMidTurnUserMessage,
   applyBranchVisibility,
   applyReloadOptimistic,
   applyRewindOptimistic,
@@ -61,7 +61,6 @@ import {
   rebindSurvivorRowIds,
   revalidateEditPlan,
   runRewindSubmit,
-  sealAcceptedCorrection,
   type SurvivorUserRowIds
 } from '../session/hooks/use-prompt-actions/rewind'
 import { useSubmitPrompt } from '../session/hooks/use-prompt-actions/submit'
@@ -272,6 +271,7 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
                 path: next.path,
                 mime: next.mime,
                 refText: next.refText,
+                stagedUpload: next.stagedUpload,
                 uploadState: next.uploadState
               })
             } else {
@@ -478,8 +478,20 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
 
         if (result?.status === 'redirected') {
           if (mode === 'interrupt') {
-            flushStreamDeltas(sessionId)
-            mutate(state => sealAcceptedCorrection(state, messageId))
+            mutate(state => {
+              const message = state.messages.find(candidate => candidate.id === messageId)
+
+              // A newer reply may precede this ACK; it already owns its boundary.
+              const hasNewReply = state.messages.slice(state.messages.findIndex(candidate => candidate.id === messageId) + 1)
+                .some(candidate => candidate.role === 'assistant')
+
+              return message && state.streamId && !hasNewReply
+                ? appendMidTurnUserMessage(
+                    { ...state, messages: state.messages.filter(candidate => candidate.id !== messageId) },
+                    message
+                  )
+                : state
+            })
           }
 
           triggerHaptic('submit')
@@ -488,12 +500,7 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
         }
 
         if (result?.status === 'queued') {
-          // A redirect queued in the build window is the next turn; an
-          // accepted steer joins this one after its running tool.
-          if (mode === 'steer') {
-            flushStreamDeltas(sessionId)
-            mutate(state => sealAcceptedCorrection(state, messageId, { keepRunningTools: true }))
-          } else {
+          if (mode === 'interrupt') {
             moveOptimisticMessageToEnd()
           }
 

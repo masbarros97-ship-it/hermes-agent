@@ -41,7 +41,6 @@ import {
   setTurnStartedAt
 } from '@/store/session'
 import { $sessionStates, isLiveTurnAwaitingEvents, isSessionRemote } from '@/store/session-states'
-import { flushStreamDeltas } from '@/store/stream-delta-flush'
 import { clearSessionSubagents } from '@/store/subagents'
 import { runGatewayRestart } from '@/store/system-actions'
 import { clearSessionTodos } from '@/store/todos'
@@ -74,7 +73,6 @@ import {
   rebindSurvivorRowIds,
   retryKeepsDeepConfirm,
   runRewindSubmit,
-  sealAcceptedCorrection,
   type SurvivorUserRowIds
 } from './rewind'
 import { useSlashCommand } from './slash'
@@ -133,7 +131,19 @@ export async function uploadComposerAttachment(
 
   const path = attachment.path ?? ''
   const label = attachment.label || pathLabel(path)
-  const uploadBytes = remote || attachmentPathNeedsUpload(path, backendCwd, terminalBackend)
+
+  // Edit-message drops bypass the main composer store, so also resolve their
+  // source descriptor here. Absence means an older browser backend/native file
+  // and retains the existing byte-upload rules.
+  const stagedUpload = attachment.kind === 'file'
+    ? attachment.stagedUpload ?? window.hermesDesktop?.getStagedFileForAttach?.(path)
+    : undefined
+
+  if (stagedUpload && stagedUpload.path !== path) {
+    throw new Error(`Could not attach ${label}: staged source changed; select the file again`)
+  }
+
+  const uploadBytes = !stagedUpload && (remote || attachmentPathNeedsUpload(path, backendCwd, terminalBackend))
 
   if (attachment.kind === 'image' && serverOwnsComposerQueue(storedSessionId ?? opts.sessionId)) {
     // Pin HTTP to the same owner before the native byte read yields. Images
@@ -196,9 +206,12 @@ export async function uploadComposerAttachment(
 
     const result = await requestGateway<FileAttachResponse>('file.attach', {
       name: label,
-      path,
       session_id: liveSessionId,
-      ...(fileDataUrl ? { data_url: fileDataUrl } : {})
+      // Omit path as well as bytes for the provenance-aware branch: an older
+      // RPC implementation must reject it rather than ignore source ownership.
+      ...(stagedUpload
+        ? { staged_upload: stagedUpload }
+        : { path, ...(fileDataUrl ? { data_url: fileDataUrl } : {}) })
     })
 
     if (!result.attached || !result.ref_text) {
@@ -209,6 +222,7 @@ export async function uploadComposerAttachment(
       ...attachment,
       attachedSessionId: liveSessionId,
       refText: result.ref_text,
+      ...(stagedUpload ? { stagedUpload } : {}),
       uploadState: undefined
     }
   }
@@ -462,6 +476,7 @@ export function usePromptActions({
                 path: nextAttachment.path,
                 mime: nextAttachment.mime,
                 refText: nextAttachment.refText,
+                stagedUpload: nextAttachment.stagedUpload,
                 uploadState: nextAttachment.uploadState
               })
             } else {
@@ -892,8 +907,21 @@ export function usePromptActions({
 
           if (result?.status === 'redirected') {
             if (mode === 'interrupt') {
-              flushStreamDeltas(id)
-              updateSessionState(id, state => sealAcceptedCorrection(state, messageId))
+              updateSessionState(id, state => {
+                const message = state.messages.find(candidate => candidate.id === messageId)
+
+                // A newer reply may precede this ACK; it already owns its boundary.
+                const hasNewReply = state.messages
+                  .slice(state.messages.findIndex(candidate => candidate.id === messageId) + 1)
+                  .some(candidate => candidate.role === 'assistant')
+
+                return message && state.streamId && !hasNewReply
+                  ? appendMidTurnUserMessage(
+                      { ...state, messages: state.messages.filter(candidate => candidate.id !== messageId) },
+                      message
+                    )
+                  : state
+              })
             }
 
             triggerHaptic('submit')
@@ -902,12 +930,9 @@ export function usePromptActions({
           }
 
           if (result?.status === 'queued') {
-            // A redirect queued in the build window is the next turn; an
-            // accepted steer joins this one after its running tool.
-            if (mode === 'steer') {
-              flushStreamDeltas(id)
-              updateSessionState(id, state => sealAcceptedCorrection(state, messageId, { keepRunningTools: true }))
-            } else {
+            // Build-window redirects become the next turn, not part of the
+            // active reply, so retain the optimistic row at the tail.
+            if (mode === 'interrupt') {
               moveOptimisticMessageToEnd()
             }
 

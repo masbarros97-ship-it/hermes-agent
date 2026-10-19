@@ -15,6 +15,7 @@ process that already imported it mount it before the listener starts, exactly as
 import asyncio
 from dataclasses import dataclass
 import logging
+from pathlib import Path
 import socket
 import sys
 import types
@@ -70,12 +71,18 @@ class GatewayDashboardMount:
         web.app.state.session_authority = getattr(self.runner, "session_authority", None)
         web.app.state.bound_host = self._state.bound_host
         web.app.state.bound_port = self._state.bound_port
+        # Which browser UI this listener serves. Read per request (web_dist() re-reads state), so a
+        # mount that has not happened yet still resolves the surface once the app is bound.
+        web.app.state.ui_surface = self._state.ui_surface
+        web.app.state.web_dist = self._state.web_dist
 
     def _unbind_state(self) -> None:
         if self.web is not None:
             self.web.app.state.gateway_runner = None
             self.web.app.state.session_authority = None
             self.web.app.state.withhold_session_token = False
+            self.web.app.state.ui_surface = None
+            self.web.app.state.web_dist = None
 
     async def ensure(self):
         """Import (off the loop), bind and start the dashboard app once; returns ``web_server``."""
@@ -135,6 +142,26 @@ class GatewayDashboardMount:
         await web.app(scope, receive, send)
 
 
+def webapp_surface() -> tuple[str, Path | None]:
+    """The browser UI this listener serves: ``(ui_surface, dist)``, from ``webapp.ui_surface``.
+
+    ``webapp`` serves the Desktop renderer (``apps/desktop/dist-webapp``) — the Webapp; ``dashboard``
+    the legacy dashboard SPA, for an operator who wants the old UI back on the same listener. The
+    dist is re-read per request (``web_dist()``), so a renderer built after the gateway started is
+    picked up without a restart.
+    """
+    from hermes_cli.config import load_config
+    from hermes_cli.webapp import webapp_dist_dir
+
+    webapp = (load_config() or {}).get("webapp") or {}
+    surface = str(webapp.get("ui_surface") or "webapp")
+    if surface not in {"webapp", "dashboard"}:
+        surface = "webapp"
+    project_root = Path(__file__).resolve().parents[1]
+    dist = webapp_dist_dir(project_root) if surface == "webapp" else None
+    return surface, dist
+
+
 async def start_gateway_api(runner, *, host: str = "127.0.0.1", port: int = 0) -> GatewayAPIHandle:
     global _ACTIVE_RUNNER
     from hermes_cli.web_server_boundary import _dashboard_public_hosts, listener_auth_required
@@ -147,11 +174,15 @@ async def start_gateway_api(runner, *, host: str = "127.0.0.1", port: int = 0) -
             loaded_web is not None and getattr(loaded_web.app.state, "gateway_runner", None) is not None):
         raise RuntimeError("gateway API already started")
     trusted = _dashboard_public_hosts()
+    ui_surface, web_dist = webapp_surface()
     state = types.SimpleNamespace(
         bound_host=host, bound_port=None, auth_required=listener_auth_required(host, trusted),
         trusted_public_hosts=trusted, gateway_runner=runner,
-        session_authority=getattr(runner, "session_authority", None))
+        session_authority=getattr(runner, "session_authority", None),
+        ui_surface=ui_surface, web_dist=web_dist)
     mount = GatewayDashboardMount(runner, state)
+    # The launcher reaches this mount through the control socket to mint a launch ticket in-process.
+    runner.dashboard_mount = mount
     # Lifespan off: the dashboard's own lifespan runs when it is mounted (GatewayDashboardMount).
     config, server = build_listener_server(mount, host, port, auth_required=state.auth_required,
                                            timeout_graceful_shutdown=5, lifespan="off")
@@ -246,8 +277,10 @@ def _restart_wait_read(runner, scope) -> bool:
 class GatewayRuntimeAPI:
     """Redeem private local tickets at the existing WS subprotocol boundary.
 
-    Other credentials and HTTP routes retain the complete dashboard gate. Local
-    bootstrap never grants an exposure/worker ticket interactive permissions.
+    Other credentials and HTTP routes retain the complete dashboard gate. A worker ticket never
+    gets interactive permissions. An exposure ticket attaches as the remote login its proxy
+    authenticated, with that login's operator rights and never native ones
+    (``runtime_bootstrap.delegated_identity``).
     *web_app* is the dashboard mount (or any object whose ``state`` carries the listener's
     ``bound_host`` / ``auth_required`` / ``trusted_public_hosts``).
     """
@@ -336,19 +369,17 @@ class GatewayRuntimeAPI:
                 or not ws.client or ws.client.host not in {'127.0.0.1', '::1'}):
             await ws.close(code=4403)
             return
-        operator = True
-        try:
-            grant = self.runner.session_ticket_store.redeem(ticket, profile_id=None, purpose='interactive')
-        except PermissionError:
-            operator = False
-            try:
-                grant = self.runner.session_ticket_store.redeem(ticket, profile_id=None, purpose='worker-adoption')
-            except PermissionError:
-                # Browser/OAuth tickets have a separate issuer.
-                if draining_socket:
-                    await ws.close(code=1013)
-                    return
-                return await self.app(scope, receive, send)
+        grant, identity = self._redeem(ticket)
+        if grant is None:
+            # Browser/OAuth tickets have a separate issuer.
+            if draining_socket:
+                await ws.close(code=1013)
+                return
+            return await self.app(scope, receive, send)
+        if identity is None:
+            await ws.close(code=4403)  # an exposure grant whose login cannot be delegated
+            return
+        operator = grant['purpose'] != 'worker-adoption'
         allow_draining = not operator
         admitted_in_wait = restart_wait_open(self.runner)
         # A restart's after-turn wait still owns its turns: an interactive client attaches to answer
@@ -368,9 +399,19 @@ class GatewayRuntimeAPI:
         from tui_gateway.ws import handle_ws
         from gateway.session_authorities import owner_scope
         with owner_scope(authority), attached_client(self.runner):
-            await handle_ws(ws, auth_identity={'user_id': grant['subject'], 'provider': 'local',
-                                              'profile_id': grant['profile_id'],
-                                              'instance_id': grant['instance_id'],
-                                              'capabilities': grant['capabilities'], 'native_bootstrap': True,
-                                              'profile_scope': grant.get('scope', 'profile')},
-                            subprotocol=CANONICAL_GATEWAY_PROTOCOL, operator=operator)
+            await handle_ws(ws, auth_identity=identity, subprotocol=CANONICAL_GATEWAY_PROTOCOL, operator=operator)
+
+    def _redeem(self, ticket):
+        """``(grant, identity)`` for the first purpose this ticket redeems as, else ``(None, None)``.
+        ``redeem`` consumes only on success, so trying each purpose in turn never burns a ticket.
+        ``identity`` is None for an exposure grant whose login cannot be delegated."""
+        from gateway.runtime_bootstrap import delegated_identity, grant_identity
+        store = self.runner.session_ticket_store
+        for purpose, identity_for in (('interactive', grant_identity), ('exposure', delegated_identity),
+                                      ('worker-adoption', grant_identity)):
+            try:
+                grant = store.redeem(ticket, profile_id=None, purpose=purpose)
+            except PermissionError:
+                continue
+            return grant, identity_for(grant)
+        return None, None

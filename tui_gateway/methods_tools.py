@@ -1259,43 +1259,12 @@ def _(rid, params: dict) -> dict:
             return err
     # The client sends session_id, not profile; the live session is authoritative.
     home = (session or {}).get("profile_home")
+    incarnation = (session or {}).get("profile_incarnation")
     scopes = _bind_build_profile_scopes(home)
     try:
-        return _configure_session_tools(rid, params, sid, session)
+        return _configure_session_tools(rid, params, sid, session, home, incarnation)
     finally:
         _release_build_profile_scopes(scopes)
-
-
-def _configure_session_tools(rid, params: dict, sid: str, session) -> dict:
-    action = str(params.get("action", "") or "").strip().lower()
-    targets = [str(name).strip() for name in params.get("names", []) or [] if str(name).strip()]
-    if action not in {"disable", "enable"}:
-        return _err(rid, 4017, f"unknown tools action: {action}")
-    if not targets:
-        return _err(rid, 4018, "names required")
-    hc, tc = _tools_mod("hermes_cli.config"), _tools_mod("hermes_cli.tools_config")
-    cfg = hc.load_config()
-    valid_toolsets = {ts_key for ts_key, _, _ in tc.CONFIGURABLE_TOOLSETS} | tc._get_plugin_toolset_keys()
-    mcp_targets = [name for name in targets if ":" in name]
-    unknown = [name for name in targets if ":" not in name and name not in valid_toolsets]
-    toolset_targets = [name for name in targets if ":" not in name and name in valid_toolsets]
-    if toolset_targets:
-        tc._apply_toolset_change(cfg, "cli", toolset_targets, action)
-    plugins = _mcp_server_rows()[1]
-    for target in mcp_targets:
-        server_name = target.split(":", 1)[0]
-        if err := _mcp_plugin_write_error(rid, server_name, plugins):
-            return err
-    missing_servers = tc._apply_mcp_change(cfg, mcp_targets, action) if mcp_targets else set()
-    hc.save_config(cfg)
-    info = _reset_session_agent(sid, session) if session else None
-    enabled = sorted(tc._get_platform_tools(hc.load_config(), "cli", include_default_mcp_servers=False))
-    changed = [
-        name for name in targets
-        if name not in unknown and (":" not in name or name.split(":", 1)[0] not in missing_servers)]
-    return _ok(rid, {
-        "changed": changed, "enabled_toolsets": enabled, "info": info,
-        "missing_servers": sorted(missing_servers), "reset": bool(session), "unknown": unknown})
 
 
 # ─── Cron / learning / skills ────────────────────────────────────────────────
@@ -1817,26 +1786,7 @@ def _plugins_settings(rid, params):
     except (ValueError, PermissionError) as e:
         return _err(rid, 4021, str(e))
     row = next((r for r in _plugin_rows() if r["key"] == canonical), None)
-    # A Desktop half applies its own preferences (a status-bar chip on/off) without polling.
-    events = _tools_mod("hermes_cli.plugin_events")
-    if events._PLUGIN_ID_RE.match(canonical):  # category keys (``image_gen/fal``) form no event name
-        events.broadcast_plugin_event(canonical, "settings.changed", {"written": written})
-    # A secret the form just stored may feed the plugin's MCP server env (``${MESHY_API_KEY}``): bounce
-    # only servers whose resolved launch inputs changed, off the RPC thread (an npx start takes seconds).
-    if plugin_dir and pc._is_portable_plugin_dir(plugin_dir):
-        servers = _portable_server_names(Path(str(plugin_dir)), canonical)
-        if servers:
-            from agent.memory_provider import spawn_context_thread  # keeps this request's profile scope
-            discovery = _tools_mod("tools.mcp_tool_discovery")
-            spawn_context_thread(discovery.restart_mcp_servers_with_new_inputs, args=(servers,),
-                                 name=f"plugin-settings-mcp-{canonical}").start()
     return _ok(rid, {"ok": True, "name": canonical, "written": written, "plugin": row})
-
-
-def _portable_server_names(plugin_dir: Path, key: str) -> set[str]:
-    package = _tools_mod("hermes_cli.agent_plugins").load_agent_plugin(plugin_dir, plugin_dir)
-    name_for = _tools_mod("hermes_cli.plugins_manifest").portable_mcp_server_name
-    return {name_for(key, server) for server in package.mcp_servers}
 
 
 def _plugins_onboarding(rid, params):
@@ -1900,3 +1850,5 @@ def _(rid, params: dict) -> dict:
 def register(server) -> None:
     """Rebind this module's helpers + handlers onto ``server`` and register the handlers."""
     bind_module(globals(), server, skip=("_",))
+    from . import methods_tools_configure
+    methods_tools_configure.register(server)

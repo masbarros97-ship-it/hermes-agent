@@ -117,9 +117,8 @@ DEFAULT_CONFIG = {
         "cron_drain_timeout": 30,
         # In-band restart (/restart, SIGUSR1): refuse new work, then wait up to this many seconds
         # for in-flight agents/cron/api runs to finish before stop(). 0 = enter stop() at once. 30
-        # min is a safety valve for wedged agents, not a target; raise for long unattended turns.
-        # Default 30 min is a safety valve for wedged agents, not a target latency — an interactive `hermes
-        # gateway restart` must never block for hours on a turn that wedged (#79133).
+        # min is a safety valve for wedged agents, not a target; raise for long unattended turns. An
+        # interactive `hermes gateway restart` must never block for hours on a wedged turn (#79133).
         "restart_after_turn_timeout": 1800,
         # Max seconds a submitted prompt waits for the deferred agent build (MCP discovery, model
         # metadata, skills scan) before failing visibly. The prompt is delivered as soon as the
@@ -315,11 +314,10 @@ DEFAULT_CONFIG = {
         # Seconds between SIGTERM and escalated SIGKILL for host process trees (browser daemons). 0
         # = SIGTERM only.
         "daemon_term_grace_seconds": 2.0,
-        # Max seconds a one-shot CLI run (-q/-Q/-z) lingers for tracked notify_on_complete
-        # background processes to finish. The dying parent owns their stdout pipes, so exiting
-        # immediately kills the delivery (e.g. Bot Mode handoff replies via message_agent /
-        # bot_relay). Plain background processes without notify_on_complete are never waited on. 0
-        # disables.
+        # Max seconds a one-shot CLI run (-q/-Q/-z) lingers for tracked notify_on_complete background
+        # processes to finish. The dying parent owns their stdout pipes, so exiting immediately kills
+        # the delivery (e.g. Bot Mode handoff replies via message_agent / bot_relay). Plain background
+        # processes without notify_on_complete are never waited on. 0 disables. See #90879.
         "oneshot_completion_wait_seconds": 600.0,
         "process_wait_auto_notify": True,  # 2 unchanged wait/poll -> notify_on_complete + stop; False = old polling
         # Env vars passed into sandboxed terminal/execute_code (plus skill-declared required_environment_variables).
@@ -452,10 +450,10 @@ DEFAULT_CONFIG = {
         # Windows browser holding its cookies) gives a fresh, signed-out browser plus a note saying why.
         # Also gates the browser_exec `local` arg (real-profile session under a cloud backend). Desktop Settings -> Browser.
         "use_real_profile": False,
-        # Windows only: a running Chrome/Edge/Brave locks its cookie DB (the last snapshot is reused;
-        # with none yet, a fresh browser runs). When on, the agent ASKS first; on approval it runs
-        # `hermes browser close-profile` (kills that profile's browser tree, unsaved tabs lost) so a
-        # new session can copy it; no auto-kill. No effect on macOS/Linux, where a running
+        # Windows only: a running Chrome/Edge/Brave locks its cookie DB, so the profile can't be
+        # copied (the session runs on a fresh browser). When on, the agent ASKS first; on approval it
+        # runs `hermes browser close-profile` (kills that profile's browser tree, unsaved tabs lost)
+        # so a new session can copy it; no auto-kill. No effect on macOS/Linux, where a running
         # browser only locks the password/autofill DBs, which are skipped (cookies still copy).
         "real_profile_autoclose": False,
         # Pin WHICH source profile directory is snapshotted for real-profile browsing (e.g. "Profile
@@ -850,9 +848,9 @@ DEFAULT_CONFIG = {
         # continues, Shift+Enter reported distinctly. False restores the c-j submit fallback for
         # POSIX PTYs whose plain Enter arrives as LF.
         "cli_multiline_shortcuts": True,
-        # `hermes`/`hermes chat` launches "cli" (prompt_toolkit REPL) | "tui" (Ink); --cli, --tui, HERMES_TUI=1 win.
-        # cli_layout = the REPL's look: "modern" (glyph rows, status under the composer) | "classic" (boxed panels).
-        "interface": "cli", "cli_layout": "modern",
+        # Interface bare `hermes`/`hermes chat` launches: "cli" (prompt_toolkit REPL) | "tui" (Ink).
+        # Flags win: `--cli` forces the REPL, `--tui` / HERMES_TUI=1 forces the TUI.
+        "interface": "cli",
         # Native TUI uses the terminal's primary buffer and scrollback instead of the custom
         # alternate-screen viewport. Flags win: `--native` / `--tui-native` and `--cli`.
         "tui_native": False,
@@ -1647,12 +1645,12 @@ DEFAULT_CONFIG = {
             # Bot API 10.1 native rich messages (tables/task lists/math). Off = legacy MarkdownV2,
             # since rich messages are hard to copy as plain text.
             "rich_messages": False,
-            # Experimental rich DM stream previews; off: Telegram Desktop/macOS overlays draft frames.
+            # Experimental rich draft previews while streaming DMs; off because Telegram
+            # Desktop/macOS can overlay draft frames until the chat redraws.
             "rich_drafts": False,
             # CJK stays on legacy MarkdownV2 (Telegram Desktop/macOS garbles rich CJK, #47653);
             # set True on an unaffected client to get native rich tables for CJK.
             "allow_cjk_rich_messages": False,
-            "dm_topic_auto_transfer": False,  # /topic mode: root-DM message opens a fresh topic
         },
     },
 
@@ -2626,11 +2624,23 @@ DEFAULT_CONFIG = {
         # (`*.foo.com`) supported.
         "extra_allowed_hosts": [],
     },
+    # The Desktop renderer, served in a browser by the profile's own gateway listener.
+    "webapp": {
+        # Which browser UI the gateway listener serves: "webapp" = the Desktop renderer
+        # (apps/desktop/dist-webapp); "dashboard" = the legacy dashboard SPA.
+        "ui_surface": "webapp",
+        # The listener's bind. Loopback only by default: a non-loopback bind needs an auth
+        # provider (the gate refuses to start without one). 0 = a free ephemeral port.
+        "listener": {"host": "127.0.0.1", "port": 0},
+    },
     "desktop": {  # Hermes Desktop (Electron) launch options; only affect `hermes desktop`.
         # CSS font-family for the app's chat and UI text (e.g. "OpenDyslexic"). Layered in front
         # of the active theme's own sans stack so missing glyphs still fall through. Empty = the
         # theme's face. The terminal pane is terminal.font_family.
         "font_family": "",
+        # The profile's Desktop/Webapp look, followed by every client; empty = each client keeps its own.
+        "theme": "",  # a Desktop theme name (not a CLI skin — that is display.skin)
+        "theme_mode": "",  # light | dark | system (system follows each device's OS setting)
         # Git repo discovery for the Projects sidebar. Empty roots are a safe
         # no-op; users must explicitly configure roots for filesystem scanning.
         # Session-derived projects remain available.
@@ -2684,7 +2694,6 @@ DEFAULT_CONFIG = {
             "max_attempts": 2,  # Crash-loop breaker: max automatic re-runs of one interrupted turn.
         },
     },
-
     "nous": {
         # Upper bound (seconds) on the Nous auth keepalive tick, which derives from the
         # server-issued credential lifetime (raising above it has no effect). 0 disables the

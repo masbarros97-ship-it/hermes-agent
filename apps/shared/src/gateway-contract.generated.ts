@@ -2814,6 +2814,14 @@ export interface FileAttachParams {
   path?: string | null
   data_url?: string | null
   name?: string | null
+  staged_upload?: StagedFileUpload | null
+}
+/** Source identity returned by the browser upload route, checked against the live profile. */
+export interface StagedFileUpload {
+  install_id: string
+  path: string
+  profile_home: string
+  profile_incarnation?: string | null
 }
 export interface FileAttachResult {
   attached: boolean
@@ -3090,6 +3098,7 @@ export interface TranscriptMessage {
   row_id?: number | null
   display_kind?: string | null
   display_metadata?: unknown | null
+  user_originated?: boolean | null
   name?: string | null
   context?: string | null
   args?: Record<string, unknown> | null
@@ -3164,6 +3173,7 @@ export interface InflightTurn {
   assistant?: string
   streaming?: boolean
   user?: string
+  user_originated?: boolean | null
   display_kind?: string | null
   display_metadata?: Record<string, unknown> | null
   corrections?: string[] | null
@@ -3619,7 +3629,6 @@ export interface SessionEventsSinceParams {
   session_id: string
   profile?: string | null
   last_seen?: number | null
-  replay_epoch?: string | null
 }
 export interface SessionEventsSinceResult {
   events: Record<string, unknown>[]
@@ -4551,7 +4560,7 @@ export interface PromptResolveUnknownParams {
   admission_id: string
   execution_generation: number
 }
-/** ``operation`` + ``payload`` are validated by ``hermes_state_mutations.validate_action``; ``expected_generation`` is required for delete/rewind/reset/branch/model/compress/reasoning/workspace. ``reasoning`` (``{effort}``) and ``workspace`` (``{cwd}``, refused ``session_busy`` mid-turn) rewrite the session's frozen policy: session-scope ``/reasoning`` and Desktop's Move to project. ``edit_policy`` (``{policy}``: ask / workspace_session / session) is an ACP session's edit approval (main's ACP modes). */
+/** ``operation`` + ``payload`` are validated by ``hermes_state_mutations.validate_action``; ``expected_generation`` is required for delete/rewind/reset/branch/model/compress/reasoning/workspace. ``reasoning`` (``{effort}``) and ``workspace`` (``{cwd}``, refused ``session_busy`` mid-turn) rewrite the session's frozen policy: session-scope ``/reasoning`` and Desktop's Move to project. */
 export interface SessionMutateParams {
   session_id: string
   request_id: string
@@ -4615,7 +4624,6 @@ export interface CanonicalSessionInfo {
   desktop_protocol: string
   profile_name: string
   cwd?: string | null
-  edit_approval_policy?: 'ask' | 'workspace_session' | 'session' | null
   launch_request?: Record<string, unknown> | null
   reasoning_effort?: string | null
   reasoning_effort_wire?: string | null
@@ -4673,19 +4681,6 @@ export interface RollbackSessionDiffResult {
   diff_lines?: number
   empty?: boolean
   error?: string | null
-}
-/** ``format``: json (default) / md / markdown / html / snapshot (``normalize_save_format``). */
-export interface SessionExportParams {
-  session_id: string
-  profile?: string | null
-  format?: string
-  redact?: boolean
-}
-/** ``gateway/session_tui_ops.py::export_session``: the rendered ``/save`` body and its default file name. The client writes it (the gateway may be remote); nothing is written on the host. */
-export interface SessionExportResult {
-  format: string
-  filename: string
-  content: string
 }
 export interface SessionAutomationParams {
   session_id: string
@@ -4999,7 +4994,6 @@ export interface CanonicalSnapshotInfo {
   profile_id?: string | null
   profile_name?: string | null
   cwd?: string | null
-  edit_approval_policy?: 'ask' | 'workspace_session' | 'session' | null
   launch_request?: Record<string, unknown> | null
   reasoning_effort?: string | null
   reasoning_effort_wire?: string | null
@@ -5534,6 +5528,21 @@ export interface GatewayReadyPayload {
   replay_epoch: string
   heartbeat?: boolean | null
   session_authority?: boolean | null
+}
+/** ``tui_gateway/change_watcher.py::_skin_changed_payload`` — the resolved skin plus the profile whose config it came from. The event reaches every transport of a process that may serve several profiles, so a client ignores a change tagged for another. Older backends send no ``profile``. */
+export interface SkinChangedPayload {
+  name?: string
+  description?: string
+  colors?: Record<string, string>
+  light_colors?: Record<string, string>
+  dark_colors?: Record<string, string>
+  branding?: Record<string, string>
+  banner_logo?: string
+  banner_hero?: string
+  tool_prefix?: string
+  help_header?: string
+  profile?: string
+  [key: string]: unknown
 }
 /** ``agent/onboarding_record.py::_transition``: the run ``run_id`` stopped being in progress. ``stored_session_id`` is its chat at the compression tip. ``done``: the first-task card was answered; ``skipped``: Skip setup; ``replaced``: a rerun opened a new run; ``deleted``: its chat was deleted. */
 export interface OnboardingEndedPayload {
@@ -6778,13 +6787,11 @@ export interface CanonicalRpcMethods {
   /** Drop this connection's subscription; a stale subscription id answers detached=false. end_reason (snake_case): the viewer is closing the conversation; the last viewer leaving an idle local session ends its row with that reason. */
   'session.detach': { params: SessionDetachParams; result: SessionDetachResult }
   'session.events.since': { params: CanonicalEventsParams; result: CanonicalEventsResult }
-  /** The /save transcript rendered for the client to write (the gateway writes nothing). */
-  'session.export': { params: SessionExportParams; result: SessionExportResult }
   /** Frozen launch policy projection of one local session. */
   'session.info': { params: CanonicalSessionInfoParams; result: CanonicalSessionInfo }
   'session.interrupt': { params: CanonicalControlParams; result: CanonicalSessionHandle }
   'session.list': { params: CanonicalListParams; result: CanonicalListResult }
-  /** Revision-fenced, retry-idempotent session edit (rename, archive, sidebar, branch, delete, rewind, reset, model, reasoning, workspace, edit_policy, compress, import). */
+  /** Revision-fenced, retry-idempotent session edit (rename, archive, sidebar, branch, delete, rewind, reset, model, reasoning, workspace, compress, import). */
   'session.mutate': { params: SessionMutateParams; result: SessionMutateResult }
   /** Local operator only: the owner deletes the ended sessions `hermes sessions prune` selected, skipping busy sessions and retained reset owners. */
   'session.prune': { params: SessionPruneParams; result: SessionPruneResult }
@@ -6838,7 +6845,6 @@ export const CANONICAL_RPC_METHODS = [
   'session.create',
   'session.detach',
   'session.events.since',
-  'session.export',
   'session.info',
   'session.interrupt',
   'session.list',
@@ -7028,7 +7034,7 @@ export interface BackendGatewayEventMap {
   /** A skill root moved (installed/removed elsewhere); refetch commands.catalog from the gateway. */
   'skills.changed': ChangeSignalPayload
   /** The active skin moved (name switch or live colour edit); repaint from this palette. */
-  'skin.changed': SkinPayload
+  'skin.changed': SkinChangedPayload
   /** Transient status line (kind: status, lifecycle, compacting, goal, loop, heartbeat, process, …). */
   'status.update': StatusUpdatePayload
   /** A child finished (status + observability rollup). */

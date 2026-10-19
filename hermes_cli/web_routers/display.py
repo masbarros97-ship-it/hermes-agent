@@ -82,6 +82,8 @@ async def display_ws(ws: WebSocket) -> None:
     if not _ws_request_is_allowed(ws):
         await ws.close(code=_CLOSE_NOT_ALLOWED)
         return
+    # No relay and no owner: the listener serving this route IS the gateway the ticket was minted
+    # against, so there is nothing to dial. The ticket is the whole gate.
     await ws.accept()
     info = _consume_display_ticket(ws)
     if info is None:

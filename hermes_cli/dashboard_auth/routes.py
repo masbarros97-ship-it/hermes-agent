@@ -557,10 +557,23 @@ async def api_auth_me(request: Request):
 async def api_auth_ws_ticket(request: Request):
     """Mint a 30s single-use ticket for a WS upgrade (browsers cannot set
     ``Authorization`` on the upgrade); one ticket per WS."""
-    sess = _require_session(request)
+    sess = getattr(request.state, "session", None)
+    if sess is None:
+        # Loopback mode (``auth_required`` False) has no OAuth Session, but the legacy
+        # ``_SESSION_TOKEN`` middleware has already validated the bearer token for non-public
+        # ``/api/`` routes — the same fallback ``/api/auth/me`` documents (GH #66223). Without it
+        # every browser socket on an unauthenticated listener would have to carry the raw session
+        # token in its URL, since the upgrade cannot set a header.
+        from hermes_cli.web_server import _has_valid_session_token
+
+        if getattr(request.app.state, "auth_required", False) or not _has_valid_session_token(request):
+            raise _http(401, "Unauthorized")
+        user_id, provider, issuer = "local", "loopback", ""
+    else:
+        user_id, provider, issuer = sess.user_id, sess.provider, sess.issuer
     from hermes_cli.dashboard_auth.ws_tickets import TTL_SECONDS, mint_ticket
-    ticket = mint_ticket(user_id=sess.user_id, provider=sess.provider, issuer=sess.issuer)
-    _audit(request, AuditEvent.WS_TICKET_MINTED, provider=sess.provider, user_id=sess.user_id)
+    ticket = mint_ticket(user_id=user_id, provider=provider, issuer=issuer)
+    _audit(request, AuditEvent.WS_TICKET_MINTED, provider=provider, user_id=user_id)
     return {"ticket": ticket, "ttl_seconds": TTL_SECONDS}
 
 

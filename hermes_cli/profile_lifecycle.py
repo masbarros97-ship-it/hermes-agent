@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 import secrets
 import shutil
+import tempfile
 import stat
 import sys
 import threading
@@ -41,6 +42,29 @@ def _profiles_root() -> Path:
     return get_default_hermes_root() / "profiles"
 
 
+def _sweep_dead_staging_entries(staging_root: Path) -> None:
+    """Drop staging entries whose owning ``profile create`` process is gone.
+
+    A killed ``create --clone-all`` leaves its staging copy under ``profiles/.profile-creating/``
+    for good, and that copy can hold the source profile's ``.env``. The next create for the same
+    name sweeps entries whose pid is no longer alive instead of letting them accumulate.
+    """
+    try:
+        entries = list(staging_root.iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        parts = entry.name.rsplit("-", 2)
+        if len(parts) != 3 or not parts[1].isdigit():
+            continue
+        try:
+            os.kill(int(parts[1]), 0)
+        except ProcessLookupError:
+            shutil.rmtree(entry, ignore_errors=True)
+        except PermissionError:
+            continue  # alive, owned by another user
+
+
 def _profile_lifecycle_modes(profiles_root: Path | None = None) -> tuple[int, int]:
     """Return directory/file modes compatible with managed shared roots."""
     try:
@@ -59,11 +83,26 @@ def _profile_lock_path(profile_home: Path | str) -> Path | None:
     return marker.parent.parent.resolve() / ".locks" / (marker.name + ".lock")
 
 
+def _mutation_lock_fallback(lock_path: Path) -> Path:
+    """Where the mutation lock lives when the profiles root is not writable.
+
+    A shared install can have a readable but read-only ``profiles/`` (e.g. ``0555``). The lock
+    then has nowhere to live beside the profile, so it moves to the temp dir, keyed by the path it
+    would have had: the flock still serialises the mutation across processes, only the file's home
+    changes.
+    """
+    digest = hashlib.sha256(str(lock_path).encode()).hexdigest()[:16]
+    return Path(tempfile.gettempdir()) / f"hermes-profile-locks-{digest}"
+
+
 @contextmanager
 def _cross_process_profile_mutation_lock(lock_path: Path, *, deadline: float) -> Iterator[None]:
     """Acquire one stable lock file without any process-wide mutex held."""
     directory_mode, file_mode = _profile_lifecycle_modes(lock_path.parent.parent)
-    lock_path.parent.mkdir(mode=directory_mode, parents=True, exist_ok=True)
+    try:
+        lock_path.parent.mkdir(mode=directory_mode, parents=True, exist_ok=True)
+    except PermissionError:
+        lock_path = _mutation_lock_fallback(lock_path)
     handle = open(lock_path, "a+b")
     try:
         # Every lease (read paths included) lands here: stat first so a settled
@@ -424,6 +463,7 @@ def create_profile_generation(
     prior_tombstone = named_profile_is_deleted(profile_dir)
     mark_profile_deleting(profile_dir)
     staging_root = profiles_root / ".profile-creating"
+    _sweep_dead_staging_entries(staging_root)
     staging_parent = staging_root / f"{canon}-{os.getpid()}-{secrets.token_hex(6)}"
     staging_dir = staging_parent / canon
     moved_to_final = False
